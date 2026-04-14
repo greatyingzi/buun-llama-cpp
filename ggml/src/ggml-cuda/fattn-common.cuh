@@ -579,6 +579,59 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
     return sum;
 }
 
+// Turbo4 K dot product with explicit codebook pointer (shared memory variant).
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0_cb(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const float * __restrict__ cb) {
+    const block_turbo4_0 * K_t4 = (const block_turbo4_0 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float cn[16];
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO4;
+        const int j_start = elem0 % QK_TURBO4;
+
+        if (ib != prev_ib) {
+            const float norm = __half2float(K_t4[ib].norm);
+#pragma unroll
+            for (int c = 0; c < 16; c++) {
+                cn[c] = cb[c] * norm;
+            }
+            prev_ib = ib;
+        }
+
+        // 4-bit indices: 2 per byte, simple nibble extraction.
+        // byte_offset is always even (j_start is always even), so 16-bit loads are safe
+        // (qs[] starts at offset 2 within block_turbo4_0, giving 2-byte alignment).
+        const int byte_offset = j_start / 2;
+
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int b0 = byte_offset + k_KQ_1;
+            const uint8_t byte0 = K_t4[ib].qs[b0];
+            const uint8_t idx0 = byte0 & 0xF;
+            const uint8_t idx1 = byte0 >> 4;
+            const float k0 = cn[idx0];
+            const float k1 = cn[idx1];
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif
+            sum += k0 * qf.x + k1 * qf.y;
+        }
+    }
+    return sum;
+}
+
 // TCQ 3-bit K dot product: 9-bit state → codebook lookup
 // Core implementation takes explicit codebook pointer for SMEM/constant flexibility
 template<int D, int nthreads>
@@ -1059,6 +1112,37 @@ static __device__ __forceinline__ void dequantize_V_turbo4_0(
     float cn[16];
 #pragma unroll
     for (int c = 0; c < 16; c++) cn[c] = d_turbo_centroids_4bit_fattn[c] * norm;
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int j = j0 + l;
+        const uint8_t idx = (j & 1) ? (x[ib].qs[j / 2] >> 4) : (x[ib].qs[j / 2] & 0xF);
+        vals[l] = cn[idx];
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
+// Turbo4 V dequant with explicit codebook pointer (shared memory variant)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_0_cb(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    const int64_t ib = i0 / QK_TURBO4;
+    const int     j0 = (int)(i0 % QK_TURBO4);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float cn[16];
+#pragma unroll
+    for (int c = 0; c < 16; c++) cn[c] = cb[c] * norm;
     float vals[ne];
 #pragma unroll
     for (int l = 0; l < ne; l++) {
