@@ -475,6 +475,57 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0(
     return sum;
 }
 
+// Turbo2 K dot product with explicit codebook pointer (shared memory variant).
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo2_0_cb(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const float * __restrict__ cb) {
+    const block_turbo2_0 * K_t2 = (const block_turbo2_0 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float cn[4];
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO2;
+        const int j_start = elem0 % QK_TURBO2;
+
+        if (ib != prev_ib) {
+            const float norm = __half2float(K_t2[ib].norm);
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                cn[c] = cb[c] * norm;
+            }
+            prev_ib = ib;
+        }
+
+        const uint8_t qs_lo = K_t2[ib].qs[j_start / 4];
+        const uint8_t qs_hi = K_t2[ib].qs[j_start / 4 + 1];
+
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int lj = k_KQ_1 * 2;
+            const uint8_t qs_b0 = (lj < 4) ? qs_lo : qs_hi;
+            const int idx0 = (qs_b0 >> ((lj % 4) * 2)) & 0x3;
+            const int lj1 = lj + 1;
+            const uint8_t qs_b1 = (lj1 < 4) ? qs_lo : qs_hi;
+            const int idx1 = (qs_b1 >> ((lj1 % 4) * 2)) & 0x3;
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
+        }
+    }
+    return sum;
+}
+
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v,
@@ -498,6 +549,63 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
 #pragma unroll
             for (int c = 0; c < 8; c++) {
                 cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
+            }
+            prev_ib = ib;
+        }
+
+        const uint8_t qs_lo = K_t3[ib].qs[j_start / 4];
+        const uint8_t qs_hi = K_t3[ib].qs[j_start / 4 + 1];
+        const uint8_t signs = K_t3[ib].signs[j_start / 8];
+
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            const int lj = k_KQ_1 * 2;
+            int idx0, idx1;
+            { const uint8_t qs_b = (lj < 4) ? qs_lo : qs_hi;
+              const uint8_t low2 = (qs_b >> ((lj % 4) * 2)) & 0x3;
+              const uint8_t hi1  = (signs >> lj) & 0x1;
+              idx0 = low2 | (hi1 << 2); }
+            { const int lj1 = lj + 1;
+              const uint8_t qs_b = (lj1 < 4) ? qs_lo : qs_hi;
+              const uint8_t low2 = (qs_b >> ((lj1 % 4) * 2)) & 0x3;
+              const uint8_t hi1  = (signs >> lj1) & 0x1;
+              idx1 = low2 | (hi1 << 2); }
+#ifdef V_DOT2_F32_F16_AVAILABLE
+            const float2 qf = __half22float2(((const half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]);
+#else
+            const float2 qf = ((const float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+#endif
+            sum += cn[idx0] * qf.x + cn[idx1] * qf.y;
+        }
+    }
+    return sum;
+}
+
+// Turbo3 K dot product with explicit codebook pointer (shared memory variant).
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0_cb(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v,
+    const float * __restrict__ cb) {
+    const block_turbo3_0 * K_t3 = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_q8); GGML_UNUSED(Q_ds_v);
+    constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+    float sum = 0.0f;
+    int prev_ib = -1;
+    float cn[8];
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+        const int base_f2 = k_KQ_0 + (threadIdx.x % nthreads) * cpy_ne;
+        const int elem0 = base_f2 * 2;
+        const int ib = elem0 / QK_TURBO3;
+        const int j_start = elem0 % QK_TURBO3;
+
+        if (ib != prev_ib) {
+            const float norm = __half2float(K_t3[ib].norm);
+#pragma unroll
+            for (int c = 0; c < 8; c++) {
+                cn[c] = cb[c] * norm;
             }
             prev_ib = ib;
         }
@@ -1065,6 +1173,40 @@ static __device__ __forceinline__ void dequantize_V_turbo2_0(
     } else { static_assert(std::is_same_v<T, void>, "bad type"); }
 }
 
+// Turbo2 V dequant with explicit codebook pointer (shared memory variant)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo2_0_cb(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
+    const block_turbo2_0 * x = (const block_turbo2_0 *) vx;
+    const int64_t ib = i0 / QK_TURBO2;
+    const int     j0 = (int)(i0 % QK_TURBO2);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float cn[4];
+#pragma unroll
+    for (int c = 0; c < 4; c++) cn[c] = cb[c] * norm;
+    const uint8_t qs_lo = x[ib].qs[j0 / 4];
+    const uint8_t qs_hi = (ne > 4 || j0 % 4 + ne > 4) ? x[ib].qs[j0 / 4 + 1] : 0;
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int lj = j0 % 4 + l;
+        const uint8_t qs_b = (lj < 4) ? qs_lo : qs_hi;
+        const int idx = (qs_b >> ((lj % 4) * 2)) & 0x3;
+        vals[l] = cn[idx];
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
 template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_turbo3_0(
         const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
@@ -1078,6 +1220,42 @@ static __device__ __forceinline__ void dequantize_V_turbo3_0(
 #pragma unroll
     for (int c = 0; c < 8; c++) cn[c] = d_turbo_centroids_3bit_fattn[c] * norm;
     // Batch-load qs and signs bytes
+    const uint8_t qs_lo = x[ib].qs[j0 / 4];
+    const uint8_t qs_hi = (ne > 4 || j0 % 4 + ne > 4) ? x[ib].qs[j0 / 4 + 1] : 0;
+    const uint8_t signs = x[ib].signs[j0 / 8];
+    float vals[ne];
+#pragma unroll
+    for (int l = 0; l < ne; l++) {
+        const int lj = j0 % 4 + l;
+        const uint8_t qs_b = (lj < 4) ? qs_lo : qs_hi;
+        const uint8_t low2 = (qs_b >> ((lj % 4) * 2)) & 0x3;
+        const uint8_t hi1  = (signs >> ((j0 % 8) + l)) & 0x1;
+        vals[l] = cn[low2 | (hi1 << 2)];
+    }
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        for (int l0 = 0; l0 < ne; l0 += 2)
+            ((half2 *)dst)[l0/2] = make_half2(__float2half(vals[l0]), __float2half(vals[l0+1]));
+    } else
+#endif
+    if constexpr (std::is_same_v<T, float>) {
+        for (int l = 0; l < ne; ++l) ((float *)dst)[l] = vals[l];
+    } else { static_assert(std::is_same_v<T, void>, "bad type"); }
+}
+
+// Turbo3 V dequant with explicit codebook pointer (shared memory variant)
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0_cb(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0,
+        const float * __restrict__ cb) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    const int64_t ib = i0 / QK_TURBO3;
+    const int     j0 = (int)(i0 % QK_TURBO3);
+    const float norm = __half2float(x[ib].norm);
+    static_assert(ne == 2 || ne == 4 || ne == 8, "bad ne");
+    float cn[8];
+#pragma unroll
+    for (int c = 0; c < 8; c++) cn[c] = cb[c] * norm;
     const uint8_t qs_lo = x[ib].qs[j0 / 4];
     const uint8_t qs_hi = (ne > 4 || j0 % 4 + ne > 4) ? x[ib].qs[j0 / 4 + 1] : 0;
     const uint8_t signs = x[ib].signs[j0 / 8];

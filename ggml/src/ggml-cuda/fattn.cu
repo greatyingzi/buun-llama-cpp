@@ -1484,49 +1484,25 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
                     kv_dequant_k_buf_size[device_dec] = k_max_bytes;
                 }
                 k_fp16_dec = kv_dequant_k_buf[device_dec];
-                // K dequant to fp16. Turbo2/3/TCQ types use inv-FWHT to produce K in original
-                // (unrotated) domain so Q stays unrotated. This mirrors the prefill path's
-                // encode→decode chain and is the only path that works on Gemma 4 ISWA + K=V global layers.
-                //
-                // Turbo4 K uses ROTATED-domain dequant (no inv-FWHT) — the expensive 7-stage
-                // butterfly is eliminated. Q is pre-rotated via FWHT to compensate (negligible
-                // cost: ~1 FWHT group per head vs N FWHT groups per KV row for inv-FWHT).
-                // This gives a large speedup at long contexts where N >> n_heads.
-                //
-                // Bug #31 exception: K=turbo2 inv-FWHT decode produces correct values for V in
-                // {turbo2, *_tcq} but a (still-undiagnosed) divergence with V in {turbo3, turbo4,
-                // q8_0, f16} on Gemma 4 26B-A4B (degenerate single-token output, attention scores
-                // collapse). The PREFILL path uses the rotated-domain kernel + Q rotation for
-                // turbo2 K and works for every V type. Mirror that here for the failing V types.
-                const bool k_t2_use_rotated = (K->type == GGML_TYPE_TURBO2_0) &&
-                    (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 ||
-                     V->type == GGML_TYPE_Q8_0    || V->type == GGML_TYPE_F16);
-                const bool k_t3_use_rotated = (K->type == GGML_TYPE_TURBO3_0) &&
-                    (V->type == GGML_TYPE_TURBO2_0);
+                // K dequant to fp16. All turbo K types use ROTATED-domain dequant (no inv-FWHT)
+                // for decode — the expensive N-stage butterfly is eliminated. Q is pre-rotated
+                // via FWHT to compensate (negligible cost: ~1 FWHT group per head vs N FWHT groups
+                // per KV row for inv-FWHT). This gives a large speedup at long contexts where N >> n_heads.
                 dim3 grid_k(K->ne[1], K->ne[2], K->ne[3]);
-                if (K->type == GGML_TYPE_TURBO2_0 && k_t2_use_rotated) {
-                    // Rotated-domain dequant: K stays in WHT-rotated space; Q is pre-rotated below.
+                if (K->type == GGML_TYPE_TURBO2_0) {
                     k_turbo2_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO2_0) {
-                    k_turbo2_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO3_0 && k_t3_use_rotated) {
-                    // Rotated-domain dequant for K=t3 + V=t2 (same Bug #31 pattern, V side).
+                } else if (K->type == GGML_TYPE_TURBO3_0) {
                     k_turbo3_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
-                } else if (K->type == GGML_TYPE_TURBO3_0) {
-                    k_turbo3_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
-                        (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO4_0) {
-                    // Rotated-domain dequant: skip inv-FWHT, Q is pre-rotated below.
                     k_turbo4_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3]);
                 } else if (K->type == GGML_TYPE_TURBO3_TCQ) {
-                    k_turbo3_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                    k_turbo3_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 } else if (K->type == GGML_TYPE_TURBO2_TCQ) {
-                    k_turbo2_tcq_dequant_f16_inv_fwht<<<grid_k, 128, 0, stream>>>(
+                    k_turbo2_tcq_dequant_f16<<<grid_k, K->ne[0], 0, stream>>>(
                         (const char *)K->data, k_fp16_dec, K->ne[0], K->ne[1], K->ne[2], K->nb[1], K->nb[2], K->nb[3], d_tcq_decode_alpha_k);
                 } else if (K->type == GGML_TYPE_Q8_0) {
                     // Q8_0 K dequant: only fires at D=512 when V is turbo (no F16/Q8_0 D=512
@@ -1596,23 +1572,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
 
         // Pre-rotate Q for turbo K stored in rotated domain.
-        // When do_decode_dequant fires, all turbo K types are dequanted via inv-FWHT into
-        // ORIGINAL domain → Q stays unrotated. When decode dequant is skipped (D>256 or
-        // GGML_TURBO_DECODE_NATIVE), turbo K is consumed by the native vec turbo dot product,
-        // which expects a pre-rotated Q — so rotate Q in that case.
+        // All turbo K types use rotated-domain dequant in decode (skip inv-FWHT optimization).
+        // When decode dequant is skipped (D>256 or GGML_TURBO_DECODE_NATIVE), turbo K is consumed
+        // by the native vec turbo dot product, which also expects pre-rotated Q.
+        // In both cases Q needs FWHT pre-rotation (cheap: ~1 group per head vs N per KV row).
         ggml_tensor Q_rot_decode;
         ggml_tensor * orig_q_decode = nullptr;
         const bool turbo_k_any = (K->type == GGML_TYPE_TURBO2_0 || K->type == GGML_TYPE_TURBO3_0 || K->type == GGML_TYPE_TURBO4_0 || K->type == GGML_TYPE_TURBO3_TCQ || K->type == GGML_TYPE_TURBO2_TCQ);
-        // Bug #31 exception: when K=turbo2/turbo3 dequant fell back to the rotated kernel (see K
-        // dispatch above), K is in WHT-rotated space, not original space, so Q must be pre-rotated.
-        // Turbo4 K always uses rotated-domain dequant for decode (skip inv-FWHT optimization).
-        const bool k_uses_rotated_path = do_decode_dequant && (
-            ((K->type == GGML_TYPE_TURBO2_0) &&
-             (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0 ||
-              V->type == GGML_TYPE_Q8_0    || V->type == GGML_TYPE_F16)) ||
-            ((K->type == GGML_TYPE_TURBO3_0) && (V->type == GGML_TYPE_TURBO2_0)) ||
-            (K->type == GGML_TYPE_TURBO4_0));
-        const bool turbo_k_in_orig_domain = do_decode_dequant && turbo_k_any && !k_uses_rotated_path;
+        const bool turbo_k_in_orig_domain = false; // All turbo K always in rotated domain for decode
         if (turbo_k_any && !turbo_k_in_orig_domain && Q->ne[0] % 128 == 0) {
             const size_t q_size = ggml_nelements(Q) * sizeof(float);
             if (q_size > q_rot_buf_size[device_dec]) {

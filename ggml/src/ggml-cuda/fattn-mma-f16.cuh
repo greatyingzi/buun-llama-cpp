@@ -463,13 +463,59 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+// Turbo4 tile loading: dequantize turbo4 blocks directly into half2 shared memory.
+template<int stride_tile, int nwarps, int nbatch_fa, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_f16_load_tile_turbo4(
+        const char * const __restrict__ KV_raw,
+        half2 * const __restrict__ tile_KV,
+        const int D2,
+        const int stride_KV_raw,
+        const int i_sup,
+        const int elem_offset,
+        const float * __restrict__ cb) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    auto load = [&] __device__ (const int n) {
+        const int stride_k = warp_size >> n;
+        const int k0_start = stride_k == warp_size ? 0 : D2 - D2 % (2*stride_k);
+        const int k0_stop  =                             D2 - D2 % (1*stride_k);
+        const int stride_i = warp_size / stride_k;
+        if (k0_start == k0_stop) { return; }
+#pragma unroll
+        for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*stride_i) {
+            const int i = i0 + threadIdx.y*stride_i + (stride_k == warp_size ? 0 : threadIdx.x / stride_k);
+            if (i0 + nwarps*stride_i > nbatch_fa && i >= nbatch_fa) { break; }
+            const char * row_ptr = KV_raw + (int64_t)i * stride_KV_raw;
+#pragma unroll
+            for (int k0 = k0_start; k0 < k0_stop; k0 += stride_k) {
+                const int k = k0 + (stride_k == warp_size ? threadIdx.x : threadIdx.x % stride_k);
+                if (!oob_check || i < i_sup) {
+                    const int j0 = elem_offset + k * 2;
+                    const int blk_idx  = j0 / QK_TURBO4;
+                    const int j_in_blk = j0 % QK_TURBO4;
+                    const block_turbo4_0 * blk = (const block_turbo4_0 *)row_ptr + blk_idx;
+                    const float norm = __half2float(blk->norm);
+                    const uint8_t idx0 = (j_in_blk & 1)     ? (blk->qs[j_in_blk / 2] >> 4) : (blk->qs[j_in_blk / 2] & 0xF);
+                    const uint8_t idx1 = ((j_in_blk+1) & 1) ? (blk->qs[(j_in_blk+1) / 2] >> 4) : (blk->qs[(j_in_blk+1) / 2] & 0xF);
+                    tile_KV[i*stride_tile + k] = make_half2(__float2half(cb[idx0] * norm), __float2half(cb[idx1] * norm));
+                } else {
+                    tile_KV[i*stride_tile + k] = make_half2(0.0f, 0.0f);
+                }
+            }
+        }
+    };
+    ggml_cuda_unroll<4>{}(load);
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
-    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ>
+    typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const float2 * const __restrict__ Q_f2,
         const half2  * const __restrict__ K_h2,
+        const char   * const __restrict__ K_raw,
         const half2  * const __restrict__ V_h2,
+        const char   * const __restrict__ V_raw,
         const half   * const __restrict__ mask_h,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
@@ -479,8 +525,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const uint3 ne01,
         const int ne02,
         const int stride_K,
+        const int stride_K_raw,
         const int stride_V,
+        const int stride_V_raw,
         const int stride_mask,
+        const float * __restrict__ turbo4_cb,
         half2        * const __restrict__ tile_Q,
         half2        * const __restrict__ tile_K,
         half2        * const __restrict__ tile_V,

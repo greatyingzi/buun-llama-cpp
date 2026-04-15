@@ -112,18 +112,22 @@ static __global__ void flash_attn_ext_vec(
     const int tid = WARP_SIZE*threadIdx.y + threadIdx.x;
     __builtin_assume(tid < nthreads);
 
-    // Shared memory codebook for K and V dequant (TCQ and turbo4).
+    // Shared memory codebook for K and V dequant (TCQ and turbo).
     // Constant memory serializes when threads hit different 32B cache lines;
     // shared memory gives full 32-bank parallel access for random lookups.
-    constexpr bool is_tcq3 = type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ;
-    constexpr bool is_tcq2 = type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ;
-    constexpr bool is_turbo4 = type_K == GGML_TYPE_TURBO4_0 || type_V == GGML_TYPE_TURBO4_0;
-    constexpr int smem_cb_size = is_tcq3 ? 512 : (is_tcq2 ? 256 : (is_turbo4 ? 16 : 0));
+    constexpr bool is_tcq3  = type_K == GGML_TYPE_TURBO3_TCQ || type_V == GGML_TYPE_TURBO3_TCQ;
+    constexpr bool is_tcq2  = type_K == GGML_TYPE_TURBO2_TCQ || type_V == GGML_TYPE_TURBO2_TCQ;
+    constexpr bool is_turbo4 = type_K == GGML_TYPE_TURBO4_0  || type_V == GGML_TYPE_TURBO4_0;
+    constexpr bool is_turbo3 = type_K == GGML_TYPE_TURBO3_0  || type_V == GGML_TYPE_TURBO3_0;
+    constexpr bool is_turbo2 = type_K == GGML_TYPE_TURBO2_0  || type_V == GGML_TYPE_TURBO2_0;
+    constexpr int smem_cb_size = is_tcq3 ? 512 : (is_tcq2 ? 256 : (is_turbo4 ? 16 : (is_turbo3 ? 8 : (is_turbo2 ? 4 : 0))));
     __shared__ float smem_codebook[smem_cb_size > 0 ? smem_cb_size : 1];
     if constexpr (smem_cb_size > 0) {
-        const float * cb_src = is_tcq3 ? d_turbo3_tcq_codebook_fattn
-                         : is_tcq2 ? d_turbo2_tcq_codebook_fattn
-                         : d_turbo_centroids_4bit_fattn;
+        const float * cb_src = is_tcq3  ? d_turbo3_tcq_codebook_fattn
+                         : is_tcq2  ? d_turbo2_tcq_codebook_fattn
+                         : is_turbo4 ? d_turbo_centroids_4bit_fattn
+                         : is_turbo3 ? d_turbo_centroids_3bit_fattn
+                         : d_turbo_centroids_2bit_fattn;
         for (int i = tid; i < smem_cb_size; i += nthreads) {
             smem_codebook[i] = cb_src[i];
         }
@@ -294,6 +298,12 @@ static __global__ void flash_attn_ext_vec(
                 if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                     sum = vec_dot_fattn_vec_KQ_turbo4_0_cb<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
+                } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+                    sum = vec_dot_fattn_vec_KQ_turbo3_0_cb<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
+                } else if constexpr (type_K == GGML_TYPE_TURBO2_0) {
+                    sum = vec_dot_fattn_vec_KQ_turbo2_0_cb<D, nthreads_KQ>(
+                        K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
                 } else if constexpr (type_K == GGML_TYPE_TURBO3_TCQ) {
                     sum = vec_dot_fattn_vec_KQ_turbo3_tcq_cb<D, nthreads_KQ>(
                         K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j], smem_codebook);
@@ -388,6 +398,12 @@ static __global__ void flash_attn_ext_vec(
                 } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
                     dequantize_V_turbo4_0_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+                    dequantize_V_turbo3_0_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO2_0) {
+                    dequantize_V_turbo2_0_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
                 } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
                     dequantize_V_turbo3_tcq_cb<half, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
@@ -428,6 +444,12 @@ static __global__ void flash_attn_ext_vec(
                 float2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_TURBO4_0) {
                     dequantize_V_turbo4_0_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+                    dequantize_V_turbo3_0_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
+                        2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
+                } else if constexpr (type_V == GGML_TYPE_TURBO2_0) {
+                    dequantize_V_turbo2_0_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread, smem_codebook);
                 } else if constexpr (type_V == GGML_TYPE_TURBO3_TCQ) {
                     dequantize_V_turbo3_tcq_cb<float, V_rows_per_thread>(V + k*nb21, tmp,
